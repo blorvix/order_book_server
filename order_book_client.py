@@ -11,7 +11,7 @@ import json
 import struct
 import sys
 import argparse
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from collections import OrderedDict
 import aiohttp
 import websockets
@@ -87,7 +87,7 @@ class OrderBookClient:
         self.target_ordinal = target_ordinal
         self.order_book = OrderBook(depth)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.websocket: Optional[websockets.WebSocketServerProtocol] = None
+        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.running = False
         
     async def start(self):
@@ -114,6 +114,8 @@ class OrderBookClient:
     async def _start_server(self):
         """Start the Order Book server."""
         logger.info("Starting Order Book server...")
+        if self.session is None:
+            raise Exception("Session not initialized")
         async with self.session.post("http://localhost:9090/start") as response:
             if response.status != 200:
                 raise Exception(f"Failed to start server: {response.status}")
@@ -122,6 +124,8 @@ class OrderBookClient:
     async def _get_snapshot(self):
         """Get initial Order Book snapshot."""
         logger.info("Getting initial Order Book snapshot...")
+        if self.session is None:
+            raise Exception("Session not initialized")
         async with self.session.get("http://localhost:9090/snapshot?depth=100") as response:
             if response.status != 200:
                 raise Exception(f"Failed to get snapshot: {response.status}")
@@ -180,39 +184,59 @@ class OrderBookClient:
                 if self.running:
                     await asyncio.sleep(1)
     
-    async def _process_delta(self, message: bytes):
+    async def _process_delta(self, message):
         """Process delta update from WebSocket."""
-        if len(message) != 26:
-            logger.warning(f"Invalid delta message length: {len(message)}")
-            return
+        # Handle both bytes and string messages
+        if isinstance(message, str):
+            # Convert string to bytes if needed
+            message = message.encode('utf-8')
         
-        try:
-            # Parse binary message: 2 bytes (bid/ask) + 8 bytes (ordinal) + 8 bytes (price) + 8 bytes (quantity)
-            is_bid, ordinal_id, price, quantity = struct.unpack('>HQQQ', message)
-            
-            # Update Order Book
-            if is_bid == 1:
-                self.order_book.update_bid(price, quantity)
-            else:
-                self.order_book.update_ask(price, quantity)
-            
-            self.order_book.last_update_id = ordinal_id
-            
-            # Log progress every 1000 updates
-            if ordinal_id % 1000 == 0:
-                bid_count, ask_count = self.order_book.get_size()
-                logger.info(f"Update {ordinal_id}: {bid_count} bids, {ask_count} asks")
-            
-            # Check if we've reached the target ordinal
-            if ordinal_id >= self.target_ordinal:
-                logger.info(f"Reached target ordinal {self.target_ordinal}, validating Order Book...")
-                await self._validate_order_book()
-                self.running = False
-                
-        except struct.error as e:
-            logger.error(f"Failed to parse delta message: {e}")
-        except Exception as e:
-            logger.error(f"Error processing delta: {e}")
+        # Debug: log message details
+        logger.debug(f"Received message: length={len(message)}, type={type(message)}")
+        
+        # Try different message lengths and formats
+        if len(message) == 26:
+            # Standard 26-byte format
+            try:
+                # Parse binary message: 2 bytes (bid/ask) + 8 bytes (ordinal) + 8 bytes (price) + 8 bytes (quantity)
+                is_bid, ordinal_id, price, quantity = struct.unpack('>HQQQ', message)
+                await self._handle_delta_update(is_bid, ordinal_id, price, quantity)
+            except struct.error as e:
+                logger.error(f"Failed to parse 26-byte delta message: {e}")
+                logger.debug(f"Message bytes: {message.hex()}")
+        elif len(message) == 28:
+            # 28-byte format - might have extra framing or padding
+            try:
+                # Try parsing as 28 bytes with potential padding
+                is_bid, ordinal_id, price, quantity = struct.unpack('>HQQQ', message[:26])
+                await self._handle_delta_update(is_bid, ordinal_id, price, quantity)
+            except struct.error as e:
+                logger.error(f"Failed to parse 28-byte delta message: {e}")
+                logger.debug(f"Message bytes: {message.hex()}")
+        else:
+            logger.warning(f"Unexpected message length: {len(message)} bytes")
+            logger.debug(f"Message content: {message}")
+    
+    async def _handle_delta_update(self, is_bid: int, ordinal_id: int, price: int, quantity: int):
+        """Handle a parsed delta update."""
+        # Update Order Book
+        if is_bid == 1:
+            self.order_book.update_bid(price, quantity)
+        else:
+            self.order_book.update_ask(price, quantity)
+        
+        self.order_book.last_update_id = ordinal_id
+        
+        # Log progress every 1000 updates
+        if ordinal_id % 1000 == 0:
+            bid_count, ask_count = self.order_book.get_size()
+            logger.info(f"Update {ordinal_id}: {bid_count} bids, {ask_count} asks")
+        
+        # Check if we've reached the target ordinal
+        if ordinal_id >= self.target_ordinal:
+            logger.info(f"Reached target ordinal {self.target_ordinal}, validating Order Book...")
+            await self._validate_order_book()
+            self.running = False
     
     async def _validate_order_book(self):
         """Send Order Book for validation."""
@@ -220,6 +244,8 @@ class OrderBookClient:
             order_book_json = self.order_book.to_json()
             
             logger.info("Sending Order Book for validation...")
+            if self.session is None:
+                raise Exception("Session not initialized")
             async with self.session.post(
                 "http://localhost:9090/assertion",
                 json=order_book_json
